@@ -169,7 +169,7 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 	if cfg.ReadIdleTimeoutSecond > 0 {
 		timeout_sec = cfg.ReadIdleTimeoutSecond
 	}
-	ctxTimeout, cancelTimeout := context.WithTimeout(context.Background(), time.Duration(timeout_sec)*time.Second)
+	ctxTimeout, cancelTimeout := context.WithTimeout(ctx, time.Duration(timeout_sec)*time.Second)
 	defer cancelTimeout()
 	var keyingMaterial [32]byte
 	switch {
@@ -224,7 +224,11 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 
 	if nconn.IsUDP {
 		if cfg.KcpWithUDP {
-			sess_kcp := doKCP(ctx, cfg, nconn.ConnLayers[0], 30*time.Second, logWriter)
+			kcp_handshake_timeout_sec := 30
+			if cfg.ReadIdleTimeoutSecond > 0 {
+				kcp_handshake_timeout_sec = cfg.ReadIdleTimeoutSecond
+			}
+			sess_kcp := doKCP(ctx, cfg, nconn.ConnLayers[0], time.Duration(kcp_handshake_timeout_sec)*time.Second, logWriter)
 			if sess_kcp == nil {
 				return nil, fmt.Errorf("failed to establish KCP session")
 			}
@@ -491,6 +495,7 @@ func createKCPBlockCryptFromKey(key []byte) (kcp.BlockCrypt, error) {
 
 // 1、建立message模式的KCP，传进来的conn背后通常是个UDPConn，这里不希望封装后变成会粘包的net.Conn。
 // 2、因为Close KCP会话对方无感知的问题，这里会再封装一层netx.FramedConn，每次发送的数据都增加2字节的长度头，所以结束时对方还可以收到个长度为0的EOF帧
+// 3、ctx负责整个会话总体生命周期的，不仅是握手阶段，因为它还传递给了startUDPKeepAlive，保持心跳
 func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeout time.Duration, logWriter io.Writer) net.Conn {
 	var sess *kcp.UDPSession
 	var err error

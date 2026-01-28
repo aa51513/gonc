@@ -56,6 +56,7 @@ type AppNetcatConfig struct {
 	app_mux_Config        *AppMuxConfig
 	app_s5s_args          string
 	app_s5s_Config        *AppS5SConfig
+	app_s5c_Config        *AppS5CConfig
 	arg_proxyc_Config     *ProxyClientConfig
 	fallbackRelayMode     bool
 	app_sh_args           string
@@ -145,6 +146,8 @@ type AppNetcatConfig struct {
 	muxLocalListener  net.Listener
 	dialreadTimeout   int
 	scanOnly          bool
+	daemon            bool
+	outputLogFile     string
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
@@ -235,6 +238,8 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.StringVar(&config.muxLocalPort, "mux-l", "", "Client mux mode: local listen port or '-' for stdin/stdout")
 	fs.IntVar(&config.dialreadTimeout, "w", 0, "timeout in seconds for dialing or idle reads (0 = disabled)")
 	fs.BoolVar(&config.scanOnly, "z", false, "connection test mode (establish connection only, no data transfer")
+	fs.BoolVar(&config.daemon, "daemon", false, "run in background (daemon mode)")
+	fs.StringVar(&config.outputLogFile, "log", "", "output log to file")
 
 	fs.StringVar(&config.runCmd, "e", "", "alias for -exec")
 	fs.BoolVar(&config.progressEnabled, "P", false, "alias for -progress")
@@ -285,7 +290,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	}
 	config.Args = fs.Args()
 	if config.verbose {
-		if config.verboseWithTime || config.keepOpen || isAppModeRequiredKeepOpen(config) || argv0 == ":nc" {
+		if config.verboseWithTime || config.keepOpen || isAppModeRequiredKeepOpen(config) || strings.HasPrefix(argv0, ":") {
 			prefix := ""
 			if argv0 != "" {
 				prefix = fmt.Sprintf("[%s] ", argv0)
@@ -293,6 +298,23 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 			config.Logger = misc.NewLog(swriter, prefix, log.LstdFlags|log.Lmsgprefix)
 			config.verboseWithTime = true
 		}
+	}
+
+	if config.daemon {
+		if err := daemonize(config); err != nil {
+			// daemonize may call os.Exit on success; error means we failed to start background process
+			fmt.Fprintf(logWriter, "Failed to daemonize: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	if config.outputLogFile != "" {
+		logFile, err := os.OpenFile(config.outputLogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Fprintf(logWriter, "Failed to open log file %s: %v\n", config.outputLogFile, err)
+			os.Exit(1)
+		}
+		swriter.SetOutput(logFile)
 	}
 
 	// 1. 初始化基本设置
@@ -919,6 +941,8 @@ func startUDPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 		return 1
 	}
 	defer uconn.Close()
+	uconn.SetReadBuffer(512 * 1024)
+	uconn.SetWriteBuffer(512 * 1024)
 	ncconfig.Logger.Printf("Listening %s on %s\n", uconn.LocalAddr().Network(), uconn.LocalAddr().String())
 
 	logDiscard := misc.NewLog(io.Discard, "[UDPSession] ", log.LstdFlags|log.Lmsgprefix)
@@ -1864,6 +1888,8 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 		if err == nil {
 			ncconfig.app_s5s_Config.AccessCtrl = ncconfig.accessControl
 		}
+	case ":s5c":
+		ncconfig.app_s5c_Config, err = AppS5CConfigByArgs(ncconfig.LogWriter, args[1:])
 	case ":nc":
 		ncconfig.app_nc_Config, err = AppNetcatConfigByArgs(ncconfig.LogWriter, ":nc", args[1:])
 	case ":sh":
@@ -2019,6 +2045,11 @@ func preinitNegotiationConfig(ncconfig *AppNetcatConfig) *secure.NegotiationConf
 	config.Certs = init_TLS(ncconfig, genCertForced)
 	config.TlsSNI = ncconfig.tlsSNI
 	config.ReadIdleTimeoutSecond = ncconfig.dialreadTimeout
+	if ncconfig.dialreadTimeout != 0 {
+		if config.UDPIdleTimeoutSecond == secure.DefaultUDPIdleTimeoutSecond {
+			config.UDPIdleTimeoutSecond = ncconfig.dialreadTimeout
+		}
+	}
 
 	if ncconfig.listenMode || ncconfig.kcpSEnabled || ncconfig.tlsServerMode {
 		config.IsClient = false
@@ -2214,6 +2245,16 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			output = pipeConn.Out
 			defer pipeConn.Close()
 			go App_s5s_main_withconfig(pipeConn, nconn.KeyingMaterial, ncconfig.app_s5s_Config, stats_in, stats_out)
+		} else if builtinApp == ":s5c" {
+			if ncconfig.app_s5c_Config == nil {
+				ncconfig.Logger.Printf("Not initialized %s config\n", builtinApp)
+				return 1
+			}
+			pipeConn := misc.NewPipeConn(nconn)
+			input = pipeConn.In
+			output = pipeConn.Out
+			defer pipeConn.Close()
+			go App_s5c_main_withconfig(pipeConn, nconn.KeyingMaterial, ncconfig.app_s5c_Config, stats_in, stats_out)
 		} else if builtinApp == ":nc" {
 			if ncconfig.app_nc_Config == nil {
 				ncconfig.Logger.Printf("Not initialized %s config\n", builtinApp)
