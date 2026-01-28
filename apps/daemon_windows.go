@@ -36,7 +36,12 @@ func daemonize(ncconfig *AppNetcatConfig) error {
 		},
 	}
 
-	proc, err := os.StartProcess(os.Args[0], os.Args, attr)
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	proc, err := os.StartProcess(exe, os.Args, attr)
 	if err != nil {
 		ncconfig.Logger.Printf("Failed to start daemonized process: %v\n", err)
 		return err
