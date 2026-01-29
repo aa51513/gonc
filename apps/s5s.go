@@ -240,6 +240,19 @@ func App_s5c_main_withconfig(connL net.Conn, keyingMaterial [32]byte, ncconfig *
 	}
 	defer nconnR.Close()
 
+	if ncconfig.remoteCall != "" {
+		_, err = nconnR.Write([]byte(ncconfig.remoteCall + "\n"))
+		if err != nil {
+			ncconfig.Logger.Printf("Error Sending: %v\n", err)
+			return 1
+		}
+	}
+
+	if ncconfig.framedStdio {
+		connL = netx.NewFramedConn(connL, connL)
+		defer connL.Close()
+	}
+
 	// 设置握手阶段的超时
 	connL.SetReadDeadline(time.Now().Add(25 * time.Second))
 	nconnR.SetReadDeadline(time.Now().Add(25 * time.Second))
@@ -310,7 +323,7 @@ func App_s5c_main_withconfig(connL net.Conn, keyingMaterial [32]byte, ncconfig *
 	if n > 2 && buf[0] == 0x05 && buf[1] == 0x03 {
 		// >>> 检测到 UDP ASSOCIATE 请求 <<<
 		// 将 UDP 处理逻辑移交给专用函数，保持主函数整洁
-		return handleUDPProxy(connL, nconnR, ncconfig, buf[:n], localAddr)
+		return handleUDPProxy(connL, keyingMaterial, nconnR, ncconfig, buf[:n], localAddr, stats_in, stats_out)
 	}
 
 	// >>> 非 UDP 请求 (如 CONNECT) <<<
@@ -336,7 +349,7 @@ func App_s5c_main_withconfig(connL net.Conn, keyingMaterial [32]byte, ncconfig *
 //	nconnR: 已经建立好加密通道的远程 TCP 连接
 //	reqData: 已经从 connL 读取到的 SOCKS5 请求头数据
 //	localBindAddr: 用于建立 UDP 连接的本地绑定地址（可为 nil）
-func handleUDPProxy(connL net.Conn, nconnR *secure.NegotiatedConn, ncconfig *AppS5CConfig, reqData []byte, localBindAddr net.Addr) int {
+func handleUDPProxy(connL net.Conn, keyingMaterial [32]byte, nconnR *secure.NegotiatedConn, ncconfig *AppS5CConfig, reqData []byte, localBindAddr net.Addr, stats_in, stats_out *misc.ProgressStats) int {
 	ncconfig.Logger.Println("Detected SOCKS5 UDP ASSOCIATE request ...")
 
 	// 1. 将请求原样转发给服务器 (因为需要服务器在远端准备 UDP 资源)
@@ -385,6 +398,19 @@ func handleUDPProxy(connL net.Conn, nconnR *secure.NegotiatedConn, ncconfig *App
 		return 1
 	}
 
+	var pktConnLocal net.PacketConn
+	var pktConnRemoteTalker net.PacketConn
+
+	pktConnLocal = localUDPConn
+
+	if keyingMaterial != [32]byte{} {
+		pktConnLocal, err = secure.NewSecureUDPConn(localUDPConn, keyingMaterial)
+		if err != nil {
+			return 1
+		}
+		defer pktConnLocal.Close()
+	}
+
 	// 5. 建立加密的 UDP 发送通道 (用于与服务器通信)
 	// 使用 ephemeral UDP socket
 	bindIP, _ := IPFromAddr(localBindAddr)
@@ -394,14 +420,17 @@ func handleUDPProxy(connL net.Conn, nconnR *secure.NegotiatedConn, ncconfig *App
 	}
 	defer remoteTalkerUDP.Close()
 
-	// 使用 nconnR 的密钥材料创建加密 UDP 连接
-	// 这个 localUDPConnSS 实现了 net.PacketConn 或类似接口，WriteTo 会加密，ReadFrom 会解密
-	localUDPConnSS, err := secure.NewSecureUDPConn(remoteTalkerUDP, nconnR.KeyingMaterial)
-	if err != nil {
-		ncconfig.Logger.Printf("Error creating secure UDP: %v\n", err)
-		return 1
+	pktConnRemoteTalker = remoteTalkerUDP
+
+	if nconnR.KeyingMaterial != [32]byte{} {
+		// 使用 nconnR 的密钥材料创建加密 UDP 连接
+		pktConnRemoteTalker, err = secure.NewSecureUDPConn(remoteTalkerUDP, nconnR.KeyingMaterial)
+		if err != nil {
+			ncconfig.Logger.Printf("Error creating secure UDP: %v\n", err)
+			return 1
+		}
+		defer pktConnRemoteTalker.Close()
 	}
-	defer localUDPConnSS.Close()
 
 	// 6. 启动 UDP 数据转发循环
 	// 记录客户端的地址，因为 SOCKS5 UDP Associate 通常是 1 对 1 的会话
@@ -418,23 +447,26 @@ func handleUDPProxy(connL net.Conn, nconnR *secure.NegotiatedConn, ncconfig *App
 		once.Do(func() {
 			close(done)
 			// 强制唤醒 ReadFrom
-			_ = localUDPConn.Close()
-			_ = localUDPConnSS.Close()
+			_ = pktConnLocal.Close()
+			_ = pktConnRemoteTalker.Close()
 			connL.Close()
 			nconnR.Close()
 		})
 	}
+	// 开始转发数据， stats_in stats_out不涉及与socks5服务器间的流量统计
 
-	// 协程 A: 本地 App (明文) -> localUDPConn -> 加密 -> 服务器
+	// 协程 A: 本地 App (明文) -> pktConnLocal -> 加密 -> 服务器
 	go func() {
 		defer wg.Done()
-		defer closeDone()             // 任何一方退出，关闭 done
-		udpBuf := make([]byte, 65535) // 移出循环，避免重复分配
+		defer closeDone() // 任何一方退出，关闭 done
+		udpBuf := make([]byte, 65535)
 		for {
-			rn, rAddr, err := localUDPConn.ReadFrom(udpBuf)
+			rn, rAddr, err := pktConnLocal.ReadFrom(udpBuf)
 			if err != nil {
 				break
 			}
+			stats_in.Update(int64(rn))
+
 			// 记录当前向我们要数据的客户端地址，以便回包时使用
 			if clientAddr == nil {
 				clientAddr = rAddr
@@ -442,27 +474,31 @@ func handleUDPProxy(connL net.Conn, nconnR *secure.NegotiatedConn, ncconfig *App
 
 			// SOCKS5 UDP 数据包结构: [RSV(2) FRAG(1) ATYP(1) DST.ADDR DST.PORT DATA]
 			// 我们不需要解析它，直接作为 payload 加密发送给服务器对应的 UDP 端口
-			_, err = localUDPConnSS.WriteTo(udpBuf[:rn], serverUDPAddr)
+			_, err = pktConnRemoteTalker.WriteTo(udpBuf[:rn], serverUDPAddr)
 			if err != nil {
 				break
 			}
 		}
 	}()
 
-	// 协程 B: 服务器 (加密) -> localUDPConnSS -> 解密 -> localUDPConn -> 本地 App
+	// 协程 B: 服务器 (加密) -> pktConnRemoteTalker -> 解密 -> pktConnLocal -> 本地 App
 	go func() {
 		defer wg.Done()
 		defer closeDone()
-		udpBuf := make([]byte, 65535) // 移出循环
+		udpBuf := make([]byte, 65535)
 		for {
-			rn, _, err := localUDPConnSS.ReadFrom(udpBuf)
+			rn, _, err := pktConnRemoteTalker.ReadFrom(udpBuf)
 			if err != nil {
 				break
 			}
 
 			// 如果我们知道客户端是谁，就转发回去
 			if clientAddr != nil {
-				localUDPConn.WriteTo(udpBuf[:rn], clientAddr)
+				_, err = pktConnLocal.WriteTo(udpBuf[:rn], clientAddr)
+				if err != nil {
+					break
+				}
+				stats_out.Update(int64(rn))
 			}
 
 		}

@@ -1765,6 +1765,7 @@ func usage_full(argv0 string, fs *flag.FlagSet) {
 	fmt.Fprintln(fs.Output(), "Built-in commands for -e option:")
 	fmt.Fprintf(fs.Output(), "  %-6s %s\n", ":mux", "Stream-multiplexing proxy")
 	fmt.Fprintf(fs.Output(), "  %-6s %s\n", ":s5s", "SOCKS5 server")
+	fmt.Fprintf(fs.Output(), "  %-6s %s\n", ":s5c", "SOCKS5 client")
 	fmt.Fprintf(fs.Output(), "  %-6s %s\n", ":nc", "netcat")
 	fmt.Fprintf(fs.Output(), "  %-6s %s\n", ":sh", "pseudo-terminal shell")
 	fmt.Fprintf(fs.Output(), "  %-6s %s\n", ":tp", "transparent proxy")

@@ -110,8 +110,8 @@ gonc -tls -psk simplekey123 -e ":s5s -b" -k -l 8443
 === "本地标准SOCKS5"
 
     ```bash
-    # 客户端调用:nc建立加密TCP连接。不支持代理UDP
-    gonc -e ":nc -tls -psk simplekey123 server-ip 8443" -k -l 127.0.0.1 1080
+    # 客户端调用:s5c建立加密TCP连接。同时支持加密代理UDP
+    gonc -e ":s5c -tls -psk simplekey123 server-ip 8443" -k -l 127.0.0.1 1080
 
     ```
 
